@@ -1,0 +1,905 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>Parcely S-JTSK</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #fbfbf9; }
+  canvas { display: block; }
+  #panel, #legend, #ctrl {
+    position: fixed; font: 12px/1.5 ui-monospace, monospace; color: #555;
+    background: #fffe; padding: 8px 10px; border: 1px solid #ddd;
+  }
+  #legend { left: 12px; bottom: 12px; white-space: pre-line; }
+  #credits {
+    position: fixed; right: 12px; bottom: 12px; max-width: 420px;
+    font: 11px/1.5 ui-monospace, monospace; color: #666;
+    background: #fffe; padding: 6px 8px; border: 1px solid #ddd;
+  }
+  #credits a { color: #06c; }
+  #ctrl { left: 12px; top: 12px; display: flex; gap: 8px; align-items: center; }
+  #ctrl input[type=range] { width: 200px; }
+  #ctrl input[type=number] { width: 70px; font: inherit; }
+  #ctrl select { font: inherit; }
+  #panel { right: 12px; top: 12px; padding: 0; }
+  #panel summary { cursor: pointer; padding: 8px 10px; }
+  #panel textarea { display: block; width: 320px; height: 300px; margin: 0 10px 10px; font: 11px/1.4 ui-monospace, monospace; }
+  #panel p { margin: 0 10px 8px; width: 320px; color: #888; }
+  #pick { margin: 0 10px 10px; width: 320px; color: #888; }
+  #pick button { font: inherit; margin: 4px 4px 0 0; }
+  #pick textarea { display: block; width: 320px; margin-top: 6px; font: 11px/1.4 ui-monospace, monospace; }
+  .dot { display: inline-block; width: 9px; height: 9px; margin-right: 6px; vertical-align: -1px;
+         border: 1px solid #0003; }
+</style>
+<canvas id="c"></canvas>
+<div id="ctrl">
+  <label for="deg">Otočení</label>
+  <input id="deg" type="range" min="-180" max="180" step="0.5" value="180">
+  <input id="degNum" type="number" min="-180" max="180" step="0.5" value="180">
+  <span>&deg;</span>
+  <label for="bg">Podklad</label>
+  <select id="bg">
+    <option value="">žádný</option>
+    <option value="orto">ortofoto</option>
+    <option value="kn">katastrální mapa</option>
+  </select>
+</div>
+<details id="panel" open>
+  <summary>Souřadnice</summary>
+  <p>Jedna množina = jeden blok, bloky odděl prázdným řádkem. První řádek bez čísel = název,
+     za svislítkem lze uvést evidovanou výměru. Na řádku bodu se berou poslední dvě čísla
+     (pořadí Y X), takže sloupec s pořadovým číslem nevadí.</p>
+  <textarea id="data" spellcheck="false">
+</textarea>
+  <div id="pick">
+    Klikáním do plánku vybírej body v pořadí, jak mají tvořit obrys
+    (snap na hranici kterékoli množiny).
+    Dva body na obvodu spojí nejkratší cesta po hranicích, i přes několik množin.
+    Jinou trasu vynutíš dalším bodem na ní, rovnou hranu Shift-klikem.
+    <button id="undo">zpět</button>
+    <button id="clr">smazat</button>
+    <button id="add">přidat jako množinu</button>
+    <textarea id="out" readonly rows="8" placeholder="souřadnice výběru"></textarea>
+  </div>
+</details>
+<div id="legend"></div>
+<div id="credits">
+  Podklad: <b>ČÚZK &ndash; on-line</b> (prohlížecí služby WMS) &middot;
+  Data: <b>ČÚZK, 2026</b>, licence
+  <a href="https://creativecommons.org/licenses/by/4.0/deed.cs" target="_blank" rel="noopener">CC BY 4.0</a> &middot;
+  <a href="https://cuzk.gov.cz/Predpisy/Podminky-poskytovani-prostor-dat-a-sitovych-sluzeb.aspx"
+     target="_blank" rel="noopener">podmínky užití</a> &middot;
+  <a href="https://geoportal.cuzk.gov.cz/(S(vcwecvq0m3o0j2fpr4sqqcjp))/Default.aspx?mode=TextMeta&amp;metadataXSL=full&amp;side=wfs&amp;metadataID=CZ-00025712-CUZK_WFS-MD_CP"
+     target="_blank" rel="noopener">metadata služby</a><br>
+  Úprava: lomové body parcel staženy z WFS INSPIRE (EPSG:5514), převedeny na kladné Y, X v S-JTSK
+  a doplněny o vlastní dělicí body. Výměry počítané ze souřadnic nejsou údajem katastru.
+</div>
+<script>
+
+// Points in S-JTSK: EPSG:5514 has negative coordinates, here converted to positive Y, X.
+// Parcel corner points come free of charge from the CUZK WFS service:
+// https://services.cuzk.gov.cz/wfs/inspire-cp-wfs.asp
+const PALETTE = ['#c0392b', '#2980b9', '#27ae60', '#8e44ad', '#d35400', '#16a085'];
+const PAD = 40;
+
+// Cadastral coordinates are rounded to centimetres, so a point that should lie on a boundary
+// can be 2 cm off it. With a millimetre tolerance such a corner never becomes a graph node.
+const ON_EDGE_TOL = 0.05;
+
+// An edge shared by two sets is a boundary that has already been carved out (the frontage of
+// a plot lying on the parcel boundary). A route along it would cut through someone else's
+// area, so it gets expensive and the ring rather walks around.
+// ponytail: a penalty, not a ban -- when no other route exists, the edge is still used.
+const SHARED_PENALTY = 1000;
+
+let sets = [], CENTER = [0, 0], angleDeg = 180;
+let picked = [], hover = null, view = null, frames = [];
+let bgImg = null, bgKey = '', bgAt = null;
+
+// One block = one set. The name is optional, an evidenced area may follow a "|".
+// On a point line the last two numbers win, so a leading index column does no harm.
+function parse(text) {
+  return text.split(/\n\s*\n/).map(b => b.trim()).filter(Boolean).map(block => {
+    const lines = block.split('\n');
+    let name = '', registered = null;
+    if (!/\d/.test(lines[0]) || /[|]/.test(lines[0])) {
+      const [n, r] = lines.shift().split('|');
+      name = n.trim();
+      registered = r === undefined ? null : parseFloat(r.replace(',', '.'));
+    }
+    const pts = lines
+      .map(l => l.match(/-?\d+(?:[.,]\d+)?/g))
+      .filter(m => m && m.length >= 2)
+      .map(m => m.slice(-2).map(v => parseFloat(v.replace(',', '.'))));
+    return { name, registered, pts };
+  }).filter(s => s.pts.length >= 3);
+}
+
+// Shoelace area of a closed polygon in m2; independent of rotation and of winding direction
+function area(P) {
+  let sum = 0;
+  for (let i = 0, n = P.length; i < n; i++) {
+    const [x1, y1] = P[i], [x2, y2] = P[(i + 1) % n];
+    sum += x1 * y2 - x2 * y1;
+  }
+  return Math.abs(sum) / 2;
+}
+
+// rotation about the common centroid, so the sets keep their relative position
+function rot(P, deg) {
+  const a = deg * Math.PI / 180, c = Math.cos(a), s = Math.sin(a);
+  return P.map(([x, y]) => {
+    const dx = x - CENTER[0], dy = y - CENTER[1];
+    return [CENTER[0] + dx * c - dy * s, CENTER[1] + dx * s + dy * c];
+  });
+}
+
+function fit(P, w, h) {
+  const xs = P.map(p => p[0]), ys = P.map(p => p[1]);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  // one scale for both axes, otherwise the drawing gets distorted
+  const scale = Math.min((w - 2 * PAD) / (maxX - minX || 1), (h - 2 * PAD) / (maxY - minY || 1));
+  const ox = (w - (maxX - minX) * scale) / 2 - minX * scale;
+  const oy = (h - (maxY - minY) * scale) / 2 - minY * scale;
+  return {
+    to: p => [p[0] * scale + ox, p[1] * scale + oy],
+    inv: p => [(p[0] - ox) / scale, (p[1] - oy) / scale],
+  };
+}
+
+// single point: rotation about the centroid (negative deg inverts it)
+function rot1(p, deg) { return rot([p], deg)[0]; }
+
+// pixel -> S-JTSK (Y, X)
+function unproject(px) {
+  const [sx, sy] = rot1(view.inv(px), -angleDeg);
+  return [sx, -sy];
+}
+
+// Nearest point on the boundary of one set. A corner point wins over an edge, otherwise two
+// corners close together would attract the wrong one. The segment parameter is searched in
+// pixels, but the resulting point is computed in world coordinates so that the snap does not
+// degrade with screen resolution.
+function snapInSet(px, pxPts, worldPts, tol) {
+  let bestVertex = null;
+  pxPts.forEach((q, i) => {
+    const d = Math.hypot(q[0] - px[0], q[1] - px[1]);
+    if (!bestVertex || d < bestVertex.d) bestVertex = { d, i };
+  });
+  if (bestVertex && bestVertex.d <= tol) {
+    return { p: worldPts[bestVertex.i].slice(), s: bestVertex.i, d: bestVertex.d, vertex: true };
+  }
+
+  let best = null;
+  for (let i = 0, n = pxPts.length; i < n; i++) {
+    const a = pxPts[i], b = pxPts[(i + 1) % n];
+    const dx = b[0] - a[0], dy = b[1] - a[1], len2 = dx * dx + dy * dy;
+    const t = len2 ? Math.max(0, Math.min(1, ((px[0] - a[0]) * dx + (px[1] - a[1]) * dy) / len2)) : 0;
+    const d = Math.hypot(px[0] - (a[0] + t * dx), px[1] - (a[1] + t * dy));
+    if (!best || d < best.d) best = { d, i, t };
+  }
+  if (!best || best.d > tol) return null;
+  const A = worldPts[best.i], B = worldPts[(best.i + 1) % worldPts.length];
+  return {
+    p: [A[0] + (B[0] - A[0]) * best.t, A[1] + (B[1] - A[1]) * best.t],
+    s: best.i + best.t, d: best.d, vertex: false,
+  };
+}
+
+// snap across all sets; a corner point wins over an edge, ties go to the earlier set
+function snapAny(px, tol) {
+  let best = null;
+  frames.forEach((F, k) => {
+    const hit = snapInSet(px, F, sets[k].pts, tol);
+    if (!hit) return;
+    if (!best || (hit.vertex && !best.vertex) || (hit.vertex === best.vertex && hit.d < best.d)) {
+      best = { ...hit, set: k };
+    }
+  });
+  return best;
+}
+
+// point on a boundary given s = side index + fraction of its length
+function pointAt(s, poly) {
+  const n = poly.length, i = ((Math.floor(s) % n) + n) % n, t = s - Math.floor(s);
+  const A = poly[i], B = poly[(i + 1) % n];
+  return [A[0] + (B[0] - A[0]) * t, A[1] + (B[1] - A[1]) * t];
+}
+
+const dist = (a, b) => Math.hypot(b[0] - a[0], b[1] - a[1]);
+
+// Backgrounds from the CUZK WMS services. Both speak EPSG:5514 directly, which removes any
+// need to reproject to Mercator: it is enough to swap the axes and flip the signs
+// (X_5514 = -Y_jtsk, Y_5514 = -X_jtsk).
+const WMS = {
+  orto: { url: 'https://ags.cuzk.gov.cz/arcgis1/services/ORTOFOTO/MapServer/WMSServer',
+          layers: '0', format: 'image/jpeg', extra: '' },
+  kn: { url: 'https://services.cuzk.gov.cz/wms/wms.asp',
+        // the KN group layer renders nothing on its own, the concrete layers must be named
+        layers: 'hranice_parcel,parcelni_cisla', format: 'image/png', extra: '&transparent=true' },
+};
+const BG_PX = 1600;
+
+// A square world window around the data with some margin. A square covers the plan at any
+// rotation, so dragging the rotation slider never triggers a new download.
+function bgBox(pts) {
+  const ys = pts.map(p => p[0]), xs = pts.map(p => p[1]);
+  const cy = (Math.min(...ys) + Math.max(...ys)) / 2, cx = (Math.min(...xs) + Math.max(...xs)) / 2;
+  const half = Math.max(Math.max(...ys) - Math.min(...ys), Math.max(...xs) - Math.min(...xs)) * 0.75;
+  return { minY: cy - half, maxY: cy + half, minX: cx - half, maxX: cx + half };
+}
+
+function bgUrl(kind, box) {
+  const w = WMS[kind];
+  // the EPSG:5514 bounding box is negative and has its axes swapped
+  const bbox = [-box.maxY, -box.maxX, -box.minY, -box.minX].map(v => v.toFixed(2)).join(',');
+  return `${w.url}?service=WMS&version=1.1.1&request=GetMap&layers=${w.layers}&styles=` +
+    `&srs=EPSG:5514&bbox=${bbox}&width=${BG_PX}&height=${BG_PX}&format=${w.format}${w.extra}`;
+}
+
+const nodeKey = p => p[0].toFixed(3) + ',' + p[1].toFixed(3);
+const edgeKey = (a, b) => a < b ? a + '|' + b : b + '|' + a;
+
+// The boundaries of all sets as a single network. A side is split at every point lying on it,
+// whether that is a clicked point or a corner of another set. That is what makes the outlines
+// connect where they merely touch, such as plot corners sitting on the parcel boundary.
+function buildGraph(polys, extra) {
+  const nodes = new Map();
+  const edges = new Map();
+  const node = p => {
+    const k = nodeKey(p);
+    if (!nodes.has(k)) nodes.set(k, { p, adj: [] });
+    return k;
+  };
+  const link = (a, b) => {
+    if (a === b) return;
+    const k = edgeKey(a, b);
+    const e = edges.get(k);
+    if (e) { e.n++; return; }
+    const w = dist(nodes.get(a).p, nodes.get(b).p);
+    if (w) edges.set(k, { a, b, w, n: 1 });
+  };
+  const all = [...polys.flat(), ...extra];
+  for (const poly of polys) {
+    for (let i = 0, n = poly.length; i < n; i++) {
+      const A = poly[i], B = poly[(i + 1) % n];
+      const dx = B[0] - A[0], dy = B[1] - A[1], len2 = dx * dx + dy * dy;
+      if (!len2) continue;
+      const cuts = all
+        .map(q => ({ q, t: ((q[0] - A[0]) * dx + (q[1] - A[1]) * dy) / len2 }))
+        .filter(({ q, t }) => t > 1e-9 && t < 1 - 1e-9 &&
+          Math.hypot(q[0] - (A[0] + t * dx), q[1] - (A[1] + t * dy)) < ON_EDGE_TOL)
+        .sort((a, b) => a.t - b.t);
+      const chain = [A, ...cuts.map(c => c.q), B].map(node);
+      for (let j = 0; j + 1 < chain.length; j++) link(chain[j], chain[j + 1]);
+    }
+  }
+  for (const e of edges.values()) {
+    const w = e.n > 1 ? e.w * SHARED_PENALTY : e.w;
+    nodes.get(e.a).adj.push({ k: e.b, w });
+    nodes.get(e.b).adj.push({ k: e.a, w });
+  }
+  return nodes;
+}
+
+// shortest route along the boundaries; returns the intermediate vertices only
+// ponytail: Dijkstra in O(n^2), there are dozens of nodes. Reach for a heap at thousands.
+function pathBetween(nodes, from, to, blocked) {
+  const kFrom = nodeKey(from), kTo = nodeKey(to);
+  if (!nodes.has(kFrom) || !nodes.has(kTo) || kFrom === kTo) return null;
+  const d = new Map([...nodes.keys()].map(k => [k, Infinity]));
+  const prev = new Map(), done = new Set();
+  d.set(kFrom, 0);
+  for (;;) {
+    let u = null;
+    for (const [k, dk] of d) if (!done.has(k) && dk < Infinity && (u === null || dk < d.get(u))) u = k;
+    if (u === null || u === kTo) break;
+    done.add(u);
+    for (const { k, w } of nodes.get(u).adj) {
+      if (blocked && blocked.has(edgeKey(u, k))) continue;
+      if (!done.has(k) && d.get(u) + w < d.get(k)) { d.set(k, d.get(u) + w); prev.set(k, u); }
+    }
+  }
+  if (d.get(kTo) === Infinity) return null;
+  const out = [];
+  for (let k = prev.get(kTo); k !== undefined && k !== kFrom; k = prev.get(k)) out.unshift(nodes.get(k).p);
+  return out;
+}
+
+// An edge between two boundary points follows the boundaries, possibly across several sets.
+// A free point or a Shift-click (edge === false) gives a straight edge instead.
+// ponytail: the shortest route is a guess at intent. Force another one with an extra point
+// on it, force a straight edge with Shift.
+function expand(ring, polys) {
+  const onEdge = ring.filter(q => q.edge);
+  const g = onEdge.length > 1 ? buildGraph(polys, onEdge.map(q => q.p)) : null;
+  // Spend every boundary edge at most once per ring, otherwise the next leg returns along the
+  // same route and the ring folds into itself -- typically when the first and the last point
+  // lie on one and the same side. When no other route is left, pathBetween returns null and
+  // the edge stays straight.
+  const used = new Set();
+  const out = [];
+  for (let i = 0; i < ring.length; i++) {
+    const a = ring[i], b = ring[(i + 1) % ring.length];
+    out.push(a.p);
+    // The closing leg always runs straight. Along the boundary it would come back all the way
+    // round and the selection would swallow the whole field.
+    if (i === ring.length - 1) continue;
+    if (!g || !a.edge || !b.edge) continue;
+    const path = pathBetween(g, a.p, b.p, used);
+    if (!path) continue;
+    const chain = [a.p, ...path, b.p].map(nodeKey);
+    for (let j = 0; j + 1 < chain.length; j++) used.add(edgeKey(chain[j], chain[j + 1]));
+    out.push(...path);
+  }
+  return out;
+}
+
+// side lengths of a closed ring; the i-th value goes from vertex i to i+1
+function edgeLengths(ring) {
+  return ring.map((v, i) => dist(v, ring[(i + 1) % ring.length]));
+}
+
+// Listing of a ring. A star marks a clicked point, the other lines are vertices filled in
+// along the boundary. Every line stays readable for parse(), which takes the last two numbers,
+// and the length rows carry a single number so parse() skips them.
+function ringText(ring, list) {
+  const len = edgeLengths(ring);
+  return ring.flatMap((v, i) => [
+    (list.some(q => q.p === v) ? '* ' : '  ') + v[0].toFixed(2) + ' ' + v[1].toFixed(2),
+    '     | ' + len[i].toFixed(2) + ' m',
+  ]).join('\n');
+}
+
+// State in the URL. Deflate cuts the link to less than half; when the browser cannot do it,
+// the JSON goes in as it is. Both forms are read, so older links keep working.
+const b64 = buf => btoa(String.fromCharCode(...new Uint8Array(buf)))
+  .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const unb64 = t => Uint8Array.from(atob(t.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+
+async function deflate(text) {
+  if (typeof CompressionStream === 'undefined') return null;
+  const cs = new Blob([text]).stream().pipeThrough(new CompressionStream('deflate-raw'));
+  return b64(await new Response(cs).arrayBuffer());
+}
+
+async function inflate(t) {
+  const ds = new Blob([unb64(t)]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+  return new Response(ds).text();
+}
+
+// A clicked point goes into the link as its coordinates plus a flag saying whether it was
+// free. Its position on a boundary is looked up again on load -- stored in the link it would
+// stop being valid anyway once the order of the sets changed.
+function stateFrom(text, list, angle, bgKind) {
+  return {
+    d: text.trim(),
+    p: list.map(q => [+q.p[0].toFixed(2), +q.p[1].toFixed(2), q.edge ? 0 : 1]),
+    a: angle,
+    bg: bgKind,
+  };
+}
+
+// Does the point lie on the boundary of any set? After loading from a link there are no
+// pixels yet, so this works in world coordinates.
+function onBoundary(p, tol) {
+  return sets.some(s => s.pts.some((A, i) => {
+    const B = s.pts[(i + 1) % s.pts.length];
+    const dx = B[0] - A[0], dy = B[1] - A[1], len2 = dx * dx + dy * dy;
+    if (!len2) return false;
+    const t = Math.max(0, Math.min(1, ((p[0] - A[0]) * dx + (p[1] - A[1]) * dy) / len2));
+    return Math.hypot(p[0] - (A[0] + t * dx), p[1] - (A[1] + t * dy)) <= tol;
+  }));
+}
+
+function pickedFrom(list) {
+  return list.map(([y, x, free]) => ({ p: [y, x], edge: !free && onBoundary([y, x], ON_EDGE_TOL) }));
+}
+
+// ring built from the clicked points in click order; its edges follow the boundaries
+function ringOf(list) {
+  return expand(list, sets.map(s => s.pts));
+}
+
+function load(text) {
+  sets = parse(text).map((s, i) => ({
+    ...s,
+    color: PALETTE[i % PALETTE.length],
+    screen: s.pts.map(([y, x]) => [y, -x]),
+  }));
+  const all = sets.flatMap(s => s.screen);
+  CENTER = all.length
+    ? [all.reduce((a, p) => a + p[0], 0) / all.length, all.reduce((a, p) => a + p[1], 0) / all.length]
+    : [0, 0];
+  draw();
+}
+
+function draw() {
+  const cv = document.getElementById('c');
+  const dpr = window.devicePixelRatio || 1;
+  const w = window.innerWidth, h = window.innerHeight;
+  cv.width = w * dpr; cv.height = h * dpr;
+  cv.style.width = w + 'px'; cv.style.height = h + 'px';
+
+  const g = cv.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  g.font = '11px ui-monospace, monospace';
+
+  const rotated = sets.map(s => rot(s.screen, angleDeg));
+  const legend = document.getElementById('legend');
+  legend.textContent = '';
+  if (!picked.length) out.value = '';
+  if (!rotated.length) {
+    legend.textContent = 'Vlož souřadnice do panelu vpravo nahoře.\n' +
+      'Jedna množina = jeden blok, na řádku bodu se berou poslední dvě čísla (Y X).';
+    return;
+  }
+
+  // one fit across all sets -> they keep their relative position
+  view = fit(rotated.flat(), w, h);
+  const to = view.to;
+  frames = rotated.map(R => R.map(to));
+  const w2s = q => rot([[q[0], -q[1]]], angleDeg).map(to)[0];
+
+  // Background: the image covers a fixed square window in the world, rotation and scale are
+  // handled by the canvas transform -- which is why rotating or moving the mouse never refetches.
+  const kind = bg.value;
+  if (kind) {
+    const box = bgBox(sets.flatMap(s => s.pts));
+    const key = kind + '|' + bgUrl(kind, box);
+    if (key !== bgKey) {
+      bgKey = key;
+      const img = new Image();
+      img.onload = () => { bgImg = img; bgAt = box; draw(); };
+      img.src = bgUrl(kind, box);
+    }
+    if (bgImg && bgAt) {
+      // image corners in the world: west is on the left (max Y), north on top (min X)
+      const tl = w2s([bgAt.maxY, bgAt.minX]);
+      const tr = w2s([bgAt.minY, bgAt.minX]);
+      const bl = w2s([bgAt.maxY, bgAt.maxX]);
+      g.save();
+      g.transform((tr[0] - tl[0]) / bgImg.width, (tr[1] - tl[1]) / bgImg.width,
+                  (bl[0] - tl[0]) / bgImg.height, (bl[1] - tl[1]) / bgImg.height, tl[0], tl[1]);
+      g.drawImage(bgImg, 0, 0);
+      g.restore();
+    }
+  } else if (bgImg) {
+    bgImg = null; bgKey = '';
+  }
+
+  rotated.forEach((R, i) => {
+    const s = sets[i], P = R.map(to);
+    g.strokeStyle = g.fillStyle = s.color;
+    g.lineWidth = 1.5;
+    g.beginPath();
+    P.forEach(([x, y], j) => j ? g.lineTo(x, y) : g.moveTo(x, y));
+    g.closePath();
+    g.globalAlpha = 0.15;
+    g.fill();
+    g.globalAlpha = 1;
+    g.stroke();
+    g.fillStyle = s.color;
+    P.forEach(([x, y], j) => {
+      g.beginPath();
+      g.arc(x, y, 3.5, 0, 2 * Math.PI);
+      g.fill();
+      if (sets.length === 1) { g.fillStyle = '#333'; g.fillText(j + 1, x + 7, y - 6); g.fillStyle = s.color; }
+    });
+
+    const A = area(s.pts);
+    const line = document.createElement('div');
+    const dot = document.createElement('span');
+    dot.className = 'dot';
+    dot.style.background = s.color;
+    line.append(dot, `${s.name || 'množina ' + (i + 1)}: ${s.pts.length} bodů, ` +
+      `${A.toFixed(1)} m² = ${(A / 10000).toFixed(4)} ha` +
+      (s.registered ? ` | katastr ${s.registered} m² ` +
+        `(${(s.registered - A > 0 ? '+' : '') + (s.registered - A).toFixed(1)} m², ` +
+        `${((s.registered / A - 1) * 100).toFixed(2)} %)` : ''));
+    legend.append(line);
+  });
+
+  if (picked.length) {
+    const ring = ringOf(picked);
+    const Q = rot(ring.map(([y, x]) => [y, -x]), angleDeg).map(to);
+    g.strokeStyle = g.fillStyle = '#111';
+    g.setLineDash([6, 4]);
+    g.beginPath();
+    Q.forEach(([x, y], j) => j ? g.lineTo(x, y) : g.moveTo(x, y));
+    if (Q.length > 2) {
+      g.closePath();
+      g.globalAlpha = 0.18;
+      g.fill();
+      g.globalAlpha = 1;
+    }
+    g.stroke();
+    g.setLineDash([]);
+    // dots only on the clicked points, vertices filled in along the boundary stay unmarked
+    rot(picked.map(q => [q.p[0], -q.p[1]]), angleDeg).map(to)
+      .forEach(([x, y]) => { g.beginPath(); g.arc(x, y, 4, 0, 2 * Math.PI); g.fill(); });
+
+    // side lengths in the plan; short legs are skipped or the labels would run together
+    const lens = edgeLengths(ring);
+    Q.forEach(([x1, y1], j) => {
+      const [x2, y2] = Q[(j + 1) % Q.length];
+      const dx = x2 - x1, dy = y2 - y1, px = Math.hypot(dx, dy);
+      if (px < 34) return;
+      const txt = lens[j].toFixed(2);
+      const [mx, my] = [(x1 + x2) / 2 - dy / px * 8, (y1 + y2) / 2 + dx / px * 8];
+      g.textAlign = 'center';
+      g.lineWidth = 3;
+      g.strokeStyle = '#fbfbf9';
+      g.strokeText(txt, mx, my + 4);      // light halo keeps the number readable over the fill
+      g.fillStyle = '#111';
+      g.fillText(txt, mx, my + 4);
+      g.textAlign = 'start';
+      g.lineWidth = 1.5;
+      g.strokeStyle = g.fillStyle = '#111';
+    });
+
+    out.value = ringText(ring, picked);
+    const A = ring.length > 2 ? area(ring) : 0;
+
+    // preview: what the area would be with the point under the cursor, before clicking
+    if (hover) {
+      const pre = ringOf([...picked, hover]);
+      const Qp = rot(pre.map(([y, x]) => [y, -x]), angleDeg).map(to);
+      g.beginPath();
+      Qp.forEach(([x, y], j) => j ? g.lineTo(x, y) : g.moveTo(x, y));
+      if (Qp.length > 2) {
+        g.closePath();
+        g.globalAlpha = 0.08;
+        g.fill();
+      }
+      g.globalAlpha = 0.4;
+      g.stroke();
+      g.globalAlpha = 1;
+      if (pre.length > 2) {
+        const preArea = area(pre);
+        const previewLine = document.createElement('div');
+        previewLine.textContent = `pod myší: ${preArea.toFixed(1)} m²` +
+          (A ? ` (${(preArea - A > 0 ? '+' : '') + (preArea - A).toFixed(1)} m²)` : '') +
+          ` | poslední úsek ${dist(picked[picked.length - 1].p, hover.p).toFixed(2)} m`;
+        legend.append(previewLine);
+      }
+    }
+    // remainder of the field = first set minus everything else (the plots already carved out)
+    const remainder = sets.length ? area(sets[0].pts) - sets.slice(1).reduce((a, s) => a + area(s.pts), 0) : 0;
+    const line = document.createElement('div');
+    line.textContent = `výběr: ${picked.length} bodů (${ring.length} vrcholů), ${A.toFixed(1)} m²` +
+      ` | obvod ${lens.reduce((a, b) => a + b, 0).toFixed(1)} m` +
+      (remainder ? ` | třetina zbytku ${(remainder / 3).toFixed(1)} m², rozdíl ` +
+        `${(A - remainder / 3 > 0 ? '+' : '') + (A - remainder / 3).toFixed(1)} m²` : '');
+    legend.append(line);
+  }
+
+  if (hover) {
+    const [hx, hy] = rot([[hover.p[0], -hover.p[1]]], angleDeg).map(to)[0];
+    g.strokeStyle = hover.edge ? '#111' : '#999';   // a black circle means snapped to a boundary
+    g.lineWidth = 1.5;
+    g.beginPath();
+    g.arc(hx, hy, 5, 0, 2 * Math.PI);
+    g.stroke();
+  }
+
+  // north arrow, so the heading stays readable at any rotation
+  const a = angleDeg * Math.PI / 180;
+  const [nx, ny] = [w - 50, h - 60];
+  g.strokeStyle = g.fillStyle = '#333';
+  g.beginPath();
+  g.moveTo(nx + Math.sin(a) * 25, ny + Math.cos(a) * 25);
+  g.lineTo(nx - Math.sin(a) * 25, ny - Math.cos(a) * 25);
+  g.stroke();
+  g.fillText('S', nx + Math.sin(a) * 34 - 3, ny + Math.cos(a) * 34 + 4);
+}
+
+// --- init
+function setAngle(v) {
+  angleDeg = Number(v) || 0;
+  deg.value = degNum.value = angleDeg;
+  draw();
+  syncUrl();
+}
+deg.oninput = e => setAngle(e.target.value);
+degNum.oninput = e => setAngle(e.target.value);
+data.oninput = e => { load(e.target.value); syncUrl(); };
+
+// the point a click would insert right now
+function atCursor(e) {
+  const px = [e.clientX, e.clientY];
+  const hit = snapAny(px, 12);
+  // Shift keeps the edge straight: the point still snaps, but does not count as a boundary point
+  return hit ? { p: hit.p, edge: !e.shiftKey } : { p: unproject(px), edge: false };
+}
+
+c.onmousemove = e => { if (view) { hover = atCursor(e); draw(); } };
+c.onmouseleave = () => { hover = null; draw(); };
+
+c.onclick = e => {
+  if (!view) return;
+  picked.push(atCursor(e));
+  draw();
+  syncUrl();
+};
+c.oncontextmenu = e => { e.preventDefault(); picked.pop(); draw(); syncUrl(); };
+undo.onclick = () => { picked.pop(); draw(); syncUrl(); };
+clr.onclick = () => { picked = []; draw(); syncUrl(); };
+add.onclick = () => {
+  if (picked.length < 3) return;
+  // the trailing "|" forces the line to be read as a name -- without it the digit in the
+  // number would make parse() take the line for a point and drop it
+  data.value = data.value.trimEnd() + '\n\nvýběr ' + (sets.length + 1) + ' |\n' +
+    ringOf(picked).map(p => p[0].toFixed(2) + ' ' + p[1].toFixed(2)).join('\n') + '\n';
+  picked = [];
+  load(data.value);
+  syncUrl();
+};
+window.onkeydown = e => { if (e.key === 'Backspace' && e.target === document.body) { picked.pop(); draw(); } };
+bg.onchange = () => { draw(); syncUrl(); };
+window.addEventListener('resize', draw);
+
+async function syncUrl() {
+  const json = JSON.stringify(stateFrom(data.value, picked, angleDeg, bg.value));
+  const z = await deflate(json);
+  history.replaceState(null, '', location.pathname + location.search +
+    '#' + (z ? 'z=' + z : 'j=' + encodeURIComponent(json)));
+}
+
+async function applyHash() {
+  const m = location.hash.slice(1).match(/^(z|j)=([\s\S]+)$/);
+  if (!m) return false;
+  const st = JSON.parse(m[1] === 'z' ? await inflate(m[2]) : decodeURIComponent(m[2]));
+  data.value = st.d || data.value;
+  angleDeg = Number(st.a) || 0;
+  deg.value = degNum.value = angleDeg;
+  bg.value = st.bg || '';
+  load(data.value);
+  picked = pickedFrom(st.p || []);
+  draw();
+  return true;
+}
+
+applyHash().catch(e => { console.warn('Odkaz se nepodařilo načíst:', e); return false; })
+  .then(ok => { if (!ok) load(data.value); });
+
+// ?test -> self-check over a synthetic fixture, so it never depends on loaded data
+if (location.search.includes('test')) {
+  const near = (a, b, t = 1e-6) => Math.abs(a - b) < t;
+
+  const S = parse(`first | 45085\n1 761610.00 1042810.00\n2 761620,00 1042820,00\n3 761630.00 1042830.00\n
+    Y X\n761640.00 1042840.00\n761650.00 1042850.00\n761660.00 1042860.00`);
+  console.assert(S.length === 2, 'parser: blocks were not split apart');
+  console.assert(S[0].name === 'first' && S[0].registered === 45085, 'parser: name or registered area');
+  console.assert(S[0].pts.length === 3 && near(S[0].pts[0][0], 761610), 'parser: leading index column');
+  console.assert(near(S[0].pts[1][1], 1042820), 'parser: decimal comma');
+  console.assert(S[1].name === 'Y X' && S[1].pts.length === 3, 'parser: a first line without digits is a name');
+
+  // a pasted markdown table: the --- separator holds no digits, the header becomes the name
+  const M = parse('| Y | X |\n| --- | --- |\n| 761658.37 | 1042803.72 |\n| 761610.13 | 1042784.24 |\n| 761568.06 | 1042912.42 |');
+  console.assert(M.length === 1 && M[0].pts.length === 3, 'parser: markdown table');
+  console.assert(near(M[0].pts[2][1], 1042912.42), 'parser: markdown values');
+  console.assert(!M[0].registered, 'parser: a missing area must not reach the legend as NaN');
+
+  console.assert(near(area([[0, 0], [10, 0], [10, 10], [0, 10]]), 100), 'shoelace: 10x10 square is not 100');
+  console.assert(near(area([[0, 0], [0, 10], [10, 10], [10, 0]]), 100), 'shoelace: winding changes the area');
+
+  // Synthetic fixture: a 300 x 200 m field with three 100 x 40 m plots carved out along one
+  // side. Two quirks are deliberate. Corners 4 and 5 of the field sit 1.3 m apart, so corner
+  // snapping has to pick the nearer one. The third plot's frontage lies 2 cm off the field
+  // boundary, the way rounding to centimetres shifts real cadastral corners.
+  const FIXTURE = `field | 60000
+761600.00 1042700.00
+761600.00 1042900.00
+761900.00 1042900.00
+761900.00 1042700.00
+761750.65 1042700.00
+761749.35 1042700.00
+
+plot 1 | 4000
+761600.00 1042900.00
+761700.00 1042900.00
+761700.00 1042860.00
+761600.00 1042860.00
+
+plot 2 | 4000
+761700.00 1042900.00
+761800.00 1042900.00
+761800.00 1042860.00
+761700.00 1042860.00
+
+plot 3 |
+761800.00 1042900.02
+761900.00 1042900.00
+761900.00 1042860.00
+761800.00 1042860.00`;
+
+  const userText = data.value, userPicked = picked, userAngle = angleDeg;
+  picked = [];
+  load(FIXTURE);
+  const field = sets[0].pts, plot1 = sets[1].pts, plot2 = sets[2].pts, plot3 = sets[3].pts;
+  const polys = sets.map(s => s.pts);
+
+  console.assert(sets.length === 4, 'fixture: not all four sets were parsed');
+  console.assert(near(area(field), 60000), 'fixture: the field is not 60000 m2');
+  console.assert(near(area(plot1), 4000) && near(area(plot2), 4000), 'fixture: a plot is not 4000 m2');
+  console.assert(near(area(plot3), 4001), 'fixture: the 2 cm offset of plot 3 is gone');
+  console.assert(near(dist(field[4], field[5]), 1.3), 'fixture: corners 4 and 5 are not 1.3 m apart');
+
+  const all = sets.flatMap(s => s.screen);
+  for (const d of [0, 37, 90, -180, 360]) {
+    for (const s of sets) {
+      const A0 = area(s.screen);
+      console.assert(near(area(rot(s.screen, d)), A0, 1e-6 * A0), 'area depends on rotation, deg=' + d);
+      console.assert(near(area(s.pts), A0, 1e-6 * A0), 'area depends on swapping the axes');
+    }
+    const R = rot(all, d), P = R.map(fit(R, 800, 600).to);
+    const xs = P.map(p => p[0]), ys = P.map(p => p[1]);
+    const spanX = Math.max(...xs) - Math.min(...xs), spanY = Math.max(...ys) - Math.min(...ys);
+    const rx = Math.max(...R.map(p => p[0])) - Math.min(...R.map(p => p[0]));
+    const ry = Math.max(...R.map(p => p[1])) - Math.min(...R.map(p => p[1]));
+    console.assert(near(spanX / spanY, rx / ry), 'aspect ratio distorted, deg=' + d);
+    console.assert(Math.min(...xs) >= PAD - 1e-6 && Math.min(...ys) >= PAD - 1e-6, 'drawing overflows, deg=' + d);
+    console.assert(near(Math.min(...xs), PAD) || near(Math.min(...ys), PAD), 'drawing does not fill, deg=' + d);
+  }
+
+  // pixel -> world transform and snapping
+  const V = fit(rot(all, 0), 800, 600);
+  for (const d of [0, 37, -180]) {
+    angleDeg = d;
+    view = V;
+    const w0 = field[0];
+    const back = unproject(V.to(rot([[w0[0], -w0[1]]], d)[0]));
+    console.assert(near(back[0], w0[0], 1e-6) && near(back[1], w0[1], 1e-6), 'unproject is not inverse, deg=' + d);
+  }
+  angleDeg = 0;
+  const F0 = rot(sets[0].screen, 0).map(V.to);
+  const mid = [(F0[0][0] + F0[1][0]) / 2, (F0[0][1] + F0[1][1]) / 2];
+  const snapped = snapInSet(mid, F0, field, 12);
+  const worldMid = [(field[0][0] + field[1][0]) / 2, (field[0][1] + field[1][1]) / 2];
+  console.assert(snapped && near(snapped.p[0], worldMid[0], 1e-9) && near(snapped.p[1], worldMid[1], 1e-9),
+    'snap: the midpoint of a side is not exact');
+  const snapV = snapInSet([F0[0][0] + 3, F0[0][1] + 3], F0, field, 12);
+  console.assert(near(snapV.p[0], field[0][0], 1e-9) && near(snapV.s, 0, 1e-9),
+    'snap: a click near a corner must land on the corner itself');
+  // corners 4 and 5 lie 1.3 m apart -> a click by corner 5 must not grab corner 4
+  const snapNear = snapInSet([F0[5][0], F0[5][1] + 2], F0, field, 12);
+  console.assert(near(snapNear.p[0], field[5][0], 1e-9), 'snap: grabbed the neighbouring corner');
+  const midLong = [(F0[1][0] + F0[2][0]) / 2, (F0[1][1] + F0[2][1]) / 2];   // side 1, 300 m
+  console.assert(near(snapInSet(midLong, F0, field, 12).s, 1.5, 1e-6), 'snap: the s parameter along a side');
+  console.assert(snapInSet([F0[0][0] + 500, F0[0][1] + 500], F0, field, 12) === null, 'snap: a distant click must grab nothing');
+
+  // a selection made of boundary points only: the first leg follows the boundary, the closing one runs straight
+  const twoOnBoundary = expand([{ p: pointAt(1.4, plot1), edge: true },
+                                { p: pointAt(3.4, plot1), edge: true }], polys);
+  console.assert(area(twoOnBoundary) > 0, 'expand: two boundary points gave zero area');
+  console.assert(area(twoOnBoundary) < area(plot1), 'expand: the closing leg did not run straight, the whole plot came out');
+  console.assert(twoOnBoundary.some(q => near(q[0], plot1[2][0], 1e-9) && near(q[1], plot1[2][1], 1e-9)),
+    'expand: the first leg did not follow the plot boundary');
+
+  // first and last point on one and the same side: the second leg must not retrace the first
+  const folded = expand([{ p: pointAt(1.2, field), edge: true },
+                         { p: pointAt(3.5, field), edge: true },
+                         { p: pointAt(1.8, field), edge: true }], polys);
+  const keys = folded.map(nodeKey);
+  console.assert(new Set(keys).size === keys.length, 'expand: the ring passes through a vertex twice');
+  // the exact invariant: no edge may be walked twice, otherwise the ring folds into itself
+  const edges = keys.map((k, i) => edgeKey(k, keys[(i + 1) % keys.length]));
+  console.assert(new Set(edges).size === edges.length, 'expand: the ring walked one edge twice');
+  console.assert(area(folded) > 0, 'expand: the folded ring gave zero area');
+
+  // the closing leg is always straight, so it never travels along the boundary
+  const threeOnBoundary = expand([{ p: pointAt(0.5, field), edge: true },
+                                  { p: pointAt(1.5, field), edge: true },
+                                  { p: pointAt(2.5, field), edge: true }], polys);
+  console.assert(area(threeOnBoundary) > 1000, 'expand: three boundary points gave a degenerate area');
+  console.assert(!threeOnBoundary.some(q => near(q[0], field[4][0], 1e-9)),
+    'expand: the closing leg came back along the boundary');
+
+  // the frontages of the plots are shared edges, so a route across them must walk around
+  const around = expand([{ p: pointAt(0.5, field), edge: true },
+                         { p: pointAt(2.5, field), edge: true }], polys);
+  console.assert([plot1[2], plot2[2], plot2[3]].every(b =>
+    around.some(q => near(q[0], b[0], 1e-9) && near(q[1], b[1], 1e-9))),
+    'expand: the route cut across the plot frontages instead of walking around them');
+
+  // The corner of plot 3 lies 2 cm off the field boundary and still has to join the network.
+  // With a millimetre tolerance it would keep only its own edges and the short link would
+  // never appear, which is exactly what once sent routes the long way round.
+  const gTol = buildGraph(polys, []);
+  const cornerNode = gTol.get(nodeKey(plot3[0]));
+  console.assert(cornerNode && cornerNode.adj.some(e => dist(gTol.get(e.k).p, plot3[0]) < ON_EDGE_TOL),
+    'buildGraph: the corner 2 cm off the boundary did not link to it');
+  console.assert(pathBetween(gTol, plot3[0], field[0]) !== null,
+    'buildGraph: the offset corner is not reachable across the field');
+
+  // background: the square window has to hold all the data with room to spare
+  const box = bgBox(sets.flatMap(s => s.pts));
+  const allPts = sets.flatMap(s => s.pts);
+  console.assert(allPts.every(q => q[0] > box.minY && q[0] < box.maxY && q[1] > box.minX && q[1] < box.maxX),
+    'bgBox: data sticks out of the window');
+  console.assert(near(box.maxY - box.minY, box.maxX - box.minX, 1e-9), 'bgBox: the window is not square');
+  // the EPSG:5514 bounding box is negative, ordered minX,minY,maxX,maxY and has its axes swapped
+  const bbox = bgUrl('orto', box).match(/bbox=([^&]+)/)[1].split(',').map(Number);
+  console.assert(bbox.every(v => v < 0), 'bgUrl: EPSG:5514 coordinates must be negative');
+  console.assert(near(bbox[0], -box.maxY, 0.01) && near(bbox[1], -box.maxX, 0.01) &&
+                 near(bbox[2], -box.minY, 0.01) && near(bbox[3], -box.minX, 0.01), 'bgUrl: axes of the bbox are swapped wrong');
+  console.assert(bbox[0] < bbox[2] && bbox[1] < bbox[3], 'bgUrl: the bbox is not ascending');
+  // background transform: a point mapped through the image corners must land where the plan puts it
+  const Vbg = fit(rot(all, 0), 800, 600);
+  for (const d of [0, 180, 37]) {
+    angleDeg = d;
+    const w2s = q => rot([[q[0], -q[1]]], d).map(Vbg.to)[0];
+    const tl = w2s([box.maxY, box.minX]), tr = w2s([box.minY, box.minX]), bl = w2s([box.maxY, box.maxX]);
+    const m11 = (tr[0] - tl[0]) / BG_PX, m12 = (tr[1] - tl[1]) / BG_PX;
+    const m21 = (bl[0] - tl[0]) / BG_PX, m22 = (bl[1] - tl[1]) / BG_PX;
+    for (const P of [field[0], field[2], plot2[1]]) {
+      const u = (P[0] - box.maxY) / (box.minY - box.maxY) * BG_PX;
+      const v = (P[1] - box.minX) / (box.maxX - box.minX) * BG_PX;
+      const viaImage = [m11 * u + m21 * v + tl[0], m12 * u + m22 * v + tl[1]];
+      const direct = w2s(P);
+      console.assert(near(viaImage[0], direct[0], 1e-6) && near(viaImage[1], direct[1], 1e-6),
+        'background: the image does not line up with the plan at rotation ' + d);
+    }
+  }
+  angleDeg = 0;
+
+  // link: the state survives a JSON round trip, boundary positions included
+  const original = [{ p: pointAt(0.5, field), edge: true },
+                    { p: pointAt(1.5, field), edge: true },
+                    { p: [761750, 1042800], edge: false }];
+  const st = JSON.parse(JSON.stringify(stateFrom('x', original, 180, 'orto')));
+  console.assert(st.a === 180 && st.bg === 'orto', 'stateFrom: rotation or background got lost');
+  console.assert(st.p[2][2] === 1 && st.p[0][2] === 0, 'stateFrom: the free point flag');
+  const restored = pickedFrom(st.p);
+  console.assert(restored[2].edge === false, 'pickedFrom: a free point snapped to a boundary');
+  console.assert(restored[0].edge && restored[1].edge, 'pickedFrom: a boundary point was not found again');
+  const ringA = ringOf(original), ringB = ringOf(restored);
+  const linkTol = 0.005 * edgeLengths(ringA).reduce((a, b) => a + b, 0) + 0.05;
+  console.assert(ringA.length === ringB.length && near(area(ringA), area(ringB), linkTol),
+    'link: the ring does not match after loading from a link');
+  console.assert(!onBoundary([761750, 1042800], ON_EDGE_TOL), 'onBoundary: grabbed a point in mid field');
+
+  // preview: a ring with the point under the cursor must not touch the stored selection
+  picked = original.slice();
+  const before = ringOf(picked), countBefore = picked.length;
+  const preview = ringOf([...picked, { p: [761760, 1042810], edge: false }]);
+  console.assert(picked.length === countBefore, 'preview: it changed the stored selection');
+  console.assert(near(area(before), area(ringOf(picked)), 1e-9), 'preview: it changed the area of the selection');
+  console.assert(area(preview) !== area(before), 'preview: the point under the cursor changed nothing');
+  picked = [];
+
+  // side lengths: closed ring, the last value leads back to the first point
+  const rect = [[0, 0], [40, 0], [40, 10], [0, 10]];
+  const lengths = edgeLengths(rect);
+  console.assert(lengths.length === 4 && near(lengths[0], 40) && near(lengths[1], 10) && near(lengths[3], 10),
+    'edgeLengths: wrong side lengths of a rectangle');
+  console.assert(near(lengths.reduce((a, b) => a + b, 0), 100), 'edgeLengths: perimeter of the rectangle is not 100');
+  console.assert(near(lengths[3], dist(rect[3], rect[0])), 'edgeLengths: the last leg does not lead back to the first point');
+  const plotSides = edgeLengths(plot1);
+  console.assert(near(plotSides[0], 100) && near(plotSides[1], 40) &&
+                 near(plotSides[2], 100) && near(plotSides[3], 40),
+    'edgeLengths: wrong dimensions of plot 1, got ' + JSON.stringify(plotSides));
+
+  // the listing of a selection has to be readable back by the parser
+  picked = original.slice();
+  const ringT = ringOf(picked);
+  const txt = ringText(ringT, picked);
+  console.assert(txt.split('\n').filter(l => l.startsWith('*')).length === picked.length,
+    'ringText: wrong number of clicked points');
+  const reparsed = parse('selection\n' + txt);
+  console.assert(reparsed.length === 1 && reparsed[0].pts.length === ringT.length,
+    'ringText: the length rows must not be read as points');
+  const perimeter = edgeLengths(ringT).reduce((a, b) => a + b, 0);
+  console.assert(near(area(reparsed[0].pts), area(ringT), 0.005 * perimeter + 0.05),
+    'ringText: rounding moved the area too far');
+
+  // put the page back the way the user left it
+  picked = userPicked;
+  angleDeg = userAngle;
+  deg.value = degNum.value = angleDeg;
+  load(userText);
+
+  console.log('self-check OK');
+}
+</script>
