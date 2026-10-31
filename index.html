@@ -4,11 +4,12 @@
 <style>
   html, body { margin: 0; height: 100%; background: #fbfbf9; }
   canvas { display: block; }
-  #panel, #legend, #ctrl {
+  #panel, #legendBox, #ctrl {
     position: fixed; font: 12px/1.5 ui-monospace, monospace; color: #555;
     background: #fffe; padding: 8px 10px; border: 1px solid #ddd;
   }
-  #legend { left: 12px; bottom: 12px; white-space: pre-line; }
+  #legendBox { left: 12px; bottom: 12px; padding: 0; }
+  #legend { white-space: pre-line; margin: 0 10px 8px; }
   #credits {
     position: fixed; right: 12px; bottom: 12px; max-width: 420px;
     font: 11px/1.5 ui-monospace, monospace; color: #666;
@@ -20,7 +21,7 @@
   #ctrl input[type=number] { width: 70px; font: inherit; }
   #ctrl select { font: inherit; }
   #panel { right: 12px; top: 12px; padding: 0; }
-  #panel summary { cursor: pointer; padding: 8px 10px; }
+  #panel summary, #legendBox summary { cursor: pointer; padding: 8px 10px; }
   #panel textarea { display: block; width: 320px; height: 300px; margin: 0 10px 10px; font: 11px/1.4 ui-monospace, monospace; }
   #panel p { margin: 0 10px 8px; width: 320px; color: #888; }
   #pick { margin: 0 10px 10px; width: 320px; color: #888; }
@@ -60,7 +61,10 @@
     <textarea id="out" readonly rows="8" placeholder="souřadnice výběru"></textarea>
   </div>
 </details>
-<div id="legend"></div>
+<details id="legendBox" open>
+  <summary>Legenda</summary>
+  <div id="legend"></div>
+</details>
 <div id="credits">
   Podklad: <b>ČÚZK &ndash; on-line</b> (prohlížecí služby WMS) &middot;
   Data: <b>ČÚZK, 2026</b>, licence
