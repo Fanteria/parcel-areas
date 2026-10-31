@@ -55,6 +55,8 @@
     (snap na hranici kterékoli množiny).
     Dva body na obvodu spojí nejkratší cesta po hranicích, i přes několik množin.
     Jinou trasu vynutíš dalším bodem na ní, rovnou hranu Shift-klikem.
+    Roh množiny přetáhni myší, přichytí se k jiné hranici nebo rohu; společný roh se posune
+    ve všech množinách. Esc přetažení zruší.
     <button id="undo">zpět</button>
     <button id="clr">smazat</button>
     <button id="add">přidat jako množinu</button>
@@ -97,6 +99,7 @@ const SHARED_PENALTY = 1000;
 let sets = [], CENTER = [0, 0], angleDeg = 180;
 let picked = [], hover = null, view = null, frames = [];
 let bgImg = null, bgKey = '', bgAt = null;
+let drag = null, wasDrag = false;
 
 // One block = one set. The name is optional, an evidenced area may follow a "|".
 // On a point line the last two numbers win, so a leading index column does no harm.
@@ -115,6 +118,22 @@ function parse(text) {
       .map(m => m.slice(-2).map(v => parseFloat(v.replace(',', '.'))));
     return { name, registered, pts };
   }).filter(s => s.pts.length >= 3);
+}
+
+// Moves every point line sitting on `from` to `to`, in all blocks at once, so a corner shared by
+// several sets stays shared. Only the last two numbers of a line change (the ones parse() reads),
+// names, index columns and table pipes stay as they were; a decimal comma is kept.
+function movePoint(text, from, to) {
+  const num = t => parseFloat(t.replace(',', '.'));
+  const fmt = (v, t) => t.includes(',') ? v.toFixed(2).replace('.', ',') : v.toFixed(2);
+  return text.split('\n').map(line => {
+    const m = [...line.matchAll(/-?\d+(?:[.,]\d+)?/g)];
+    if (m.length < 2) return line;
+    const [a, b] = m.slice(-2);
+    if (dist([num(a[0]), num(b[0])], from) >= ON_EDGE_TOL) return line;
+    return line.slice(0, a.index) + fmt(to[0], a[0]) + line.slice(a.index + a[0].length, b.index) +
+      fmt(to[1], b[0]) + line.slice(b.index + b[0].length);
+  }).join('\n');
 }
 
 // Shoelace area of a closed polygon in m2; independent of rotation and of winding direction
@@ -162,10 +181,11 @@ function unproject(px) {
 // Nearest point on the boundary of one set. A corner point wins over an edge, otherwise two
 // corners close together would attract the wrong one. The segment parameter is searched in
 // pixels, but the resulting point is computed in world coordinates so that the snap does not
-// degrade with screen resolution.
-function snapInSet(px, pxPts, worldPts, tol) {
+// degrade with screen resolution. Corners in `skip` are left out together with their sides.
+function snapInSet(px, pxPts, worldPts, tol, skip = new Set()) {
   let bestVertex = null;
   pxPts.forEach((q, i) => {
+    if (skip.has(i)) return;
     const d = Math.hypot(q[0] - px[0], q[1] - px[1]);
     if (!bestVertex || d < bestVertex.d) bestVertex = { d, i };
   });
@@ -175,6 +195,7 @@ function snapInSet(px, pxPts, worldPts, tol) {
 
   let best = null;
   for (let i = 0, n = pxPts.length; i < n; i++) {
+    if (skip.has(i) || skip.has((i + 1) % n)) continue;
     const a = pxPts[i], b = pxPts[(i + 1) % n];
     const dx = b[0] - a[0], dy = b[1] - a[1], len2 = dx * dx + dy * dy;
     const t = len2 ? Math.max(0, Math.min(1, ((px[0] - a[0]) * dx + (px[1] - a[1]) * dy) / len2)) : 0;
@@ -189,11 +210,12 @@ function snapInSet(px, pxPts, worldPts, tol) {
   };
 }
 
-// snap across all sets; a corner point wins over an edge, ties go to the earlier set
-function snapAny(px, tol) {
+// snap across all sets; a corner point wins over an edge, ties go to the earlier set.
+// skip = [[set, corner]], the corners being dragged, so they never snap to themselves.
+function snapAny(px, tol, skip = []) {
   let best = null;
   frames.forEach((F, k) => {
-    const hit = snapInSet(px, F, sets[k].pts, tol);
+    const hit = snapInSet(px, F, sets[k].pts, tol, new Set(skip.filter(l => l[0] === k).map(l => l[1])));
     if (!hit) return;
     if (!best || (hit.vertex && !best.vertex) || (hit.vertex === best.vertex && hit.d < best.d)) {
       best = { ...hit, set: k };
@@ -439,8 +461,9 @@ function draw() {
     return;
   }
 
-  // one fit across all sets -> they keep their relative position
-  view = fit(rotated.flat(), w, h);
+  // one fit across all sets -> they keep their relative position. Frozen while a corner is being
+  // dragged, otherwise moving an outer corner would rescale the plan under the cursor.
+  if (!drag?.moved) view = fit(rotated.flat(), w, h);
   const to = view.to;
   frames = rotated.map(R => R.map(to));
   const w2s = q => rot([[q[0], -q[1]]], angleDeg).map(to)[0];
@@ -617,11 +640,47 @@ function atCursor(e) {
   return hit ? { p: hit.p, edge: !e.shiftKey } : { p: unproject(px), edge: false };
 }
 
-c.onmousemove = e => { if (view) { hover = atCursor(e); draw(); } };
+c.onmousemove = e => { if (view && !drag?.moved) { hover = atCursor(e); draw(); } };
 c.onmouseleave = () => { hover = null; draw(); };
 
+// Dragging a corner moves it in every set that has a corner there, together with the clicked
+// points sitting on it. Under 4 px the press stays a click, so picking corners works as before.
+c.onmousedown = e => {
+  wasDrag = false;
+  const hit = view && e.button === 0 && snapAny([e.clientX, e.clientY], 12);
+  if (!hit || !hit.vertex) { drag = null; return; }
+  const near = p => dist(p, hit.p) < ON_EDGE_TOL;
+  drag = {
+    from: hit.p, to: hit.p, x: e.clientX, y: e.clientY, moved: false,
+    links: sets.flatMap((s, k) => s.pts.flatMap((p, i) => near(p) ? [[k, i]] : [])),
+    picks: picked.filter(q => near(q.p)).map(q => [q, q.p]),
+  };
+};
+window.addEventListener('mousemove', e => {
+  if (!drag || (!drag.moved && Math.hypot(e.clientX - drag.x, e.clientY - drag.y) < 4)) return;
+  drag.moved = true;
+  // Snaps to the other boundaries like a click does, so a corner can be attached to a line or to
+  // another corner. Rounded to centimetres like the text, so the picks keep matching the graph
+  // nodes after reload; a point on a line stays well inside ON_EDGE_TOL.
+  const px = [e.clientX, e.clientY], hit = snapAny(px, 12, drag.links);
+  const p = drag.to = (hit ? hit.p : unproject(px)).map(v => +v.toFixed(2));
+  for (const [k, i] of drag.links) { sets[k].pts[i] = p.slice(); sets[k].screen[i] = [p[0], -p[1]]; }
+  for (const [q] of drag.picks) q.p = p.slice();
+  hover = null;
+  draw();
+});
+window.addEventListener('mouseup', () => {
+  const d = drag;
+  drag = null;   // before load(), so the plan fits the moved corner again
+  if (!d?.moved) return;
+  wasDrag = true;
+  data.value = movePoint(data.value, d.from, d.to);
+  load(data.value);
+  syncUrl();
+});
+
 c.onclick = e => {
-  if (!view) return;
+  if (!view || wasDrag) return;
   picked.push(atCursor(e));
   draw();
   syncUrl();
@@ -639,7 +698,16 @@ add.onclick = () => {
   load(data.value);
   syncUrl();
 };
-window.onkeydown = e => { if (e.key === 'Backspace' && e.target === document.body) { picked.pop(); draw(); } };
+window.onkeydown = e => {
+  if (e.key === 'Backspace' && e.target === document.body) { picked.pop(); draw(); }
+  // Esc cancels a drag: the text is written only on release, so reloading it restores the sets
+  if (e.key === 'Escape' && drag?.moved) {
+    for (const [q, p] of drag.picks) q.p = p;
+    wasDrag = true;
+    drag = null;
+    load(data.value);
+  }
+};
 bg.onchange = () => { draw(); syncUrl(); };
 window.addEventListener('resize', draw);
 
@@ -684,6 +752,16 @@ if (location.search.includes('test')) {
   console.assert(M.length === 1 && M[0].pts.length === 3, 'parser: markdown table');
   console.assert(near(M[0].pts[2][1], 1042912.42), 'parser: markdown values');
   console.assert(!M[0].registered, 'parser: a missing area must not reach the legend as NaN');
+
+  // moving a shared corner: both copies move (the second one 1 cm off), the rest stays byte-identical
+  const before2 = 'a | 100\n1 761600.00 1042700.00\n2 761610,00 1042700,00\n3 761620.00 1042710.00\n\n' +
+                  'b\n| 761610.01 | 1042700.00 |\n761630.00 1042700.00\n761630.00 1042720.00';
+  const after2 = movePoint(before2, [761610, 1042700], [761615.5, 1042705.25]);
+  console.assert(after2 === 'a | 100\n1 761600.00 1042700.00\n2 761615,50 1042705,25\n3 761620.00 1042710.00\n\n' +
+                 'b\n| 761615.50 | 1042705.25 |\n761630.00 1042700.00\n761630.00 1042720.00',
+    'movePoint: wrong lines changed, got ' + JSON.stringify(after2));
+  const P2 = parse(after2);
+  console.assert(near(P2[0].pts[1][0], 761615.5) && near(P2[1].pts[0][1], 1042705.25), 'movePoint: parse does not see the move');
 
   console.assert(near(area([[0, 0], [10, 0], [10, 10], [0, 10]]), 100), 'shoelace: 10x10 square is not 100');
   console.assert(near(area([[0, 0], [0, 10], [10, 10], [10, 0]]), 100), 'shoelace: winding changes the area');
@@ -772,6 +850,13 @@ plot 3 |
   const midLong = [(F0[1][0] + F0[2][0]) / 2, (F0[1][1] + F0[2][1]) / 2];   // side 1, 300 m
   console.assert(near(snapInSet(midLong, F0, field, 12).s, 1.5, 1e-6), 'snap: the s parameter along a side');
   console.assert(snapInSet([F0[0][0] + 500, F0[0][1] + 500], F0, field, 12) === null, 'snap: a distant click must grab nothing');
+  // dragging: the dragged corner and its own sides are skipped, so it attaches to something else
+  console.assert(snapInSet([F0[0][0] + 3, F0[0][1] + 3], F0, field, 12, new Set([0])) === null,
+    'snap: a dragged corner snapped to itself or to its own sides');
+  const glued = snapAny(frames[0][1], 12, [[0, 1]]);
+  console.assert(glued && glued.set === 1 && glued.vertex &&
+                 near(glued.p[0], plot1[0][0], 1e-9) && near(glued.p[1], plot1[0][1], 1e-9),
+    'snap: a dragged corner did not attach to the corner of another set');
 
   // a selection made of boundary points only: the first leg follows the boundary, the closing one runs straight
   const twoOnBoundary = expand([{ p: pointAt(1.4, plot1), edge: true },
